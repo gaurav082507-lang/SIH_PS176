@@ -1,0 +1,10 @@
+streamlit
+python-dotenv
+langchain
+langgraph
+pandas
+numpy
+openmeteo-requests
+requests-cache
+retry-requests
+langchain-mistralai
