@@ -384,14 +384,19 @@ with st.sidebar:
         st.session_state["picked_lat"] = default_lat
         st.session_state["picked_lon"] = default_lon
 
-    # Detect a mode switch so the relevant widget re-seeds from the
-    # canonical picked_lat/picked_lon instead of showing a stale value
-    # (Streamlit ignores `value=` on reruns once a widget `key` exists).
+    # Detect a mode switch, or an external update (e.g. a map click handled
+    # further down the page) so the relevant widget re-seeds from the
+    # canonical picked_lat/picked_lon instead of showing a stale value.
+    # (Streamlit ignores `value=` on reruns once a widget `key` exists, and
+    # won't let us overwrite a widget's key *after* it has already run this
+    # script pass — so any external update sets this flag and reruns, and
+    # we consume it here, *before* the widgets below are instantiated.)
     mode_changed = st.session_state.get("prev_loc_mode") != loc_mode
     st.session_state["prev_loc_mode"] = loc_mode
+    force_resync = st.session_state.pop("force_resync_location", False)
 
     if loc_mode == "Manual entry":
-        if mode_changed or "manual_lat_input" not in st.session_state:
+        if mode_changed or force_resync or "manual_lat_input" not in st.session_state:
             st.session_state["manual_lat_input"] = float(st.session_state["picked_lat"])
             st.session_state["manual_lon_input"] = float(st.session_state["picked_lon"])
 
@@ -408,7 +413,7 @@ with st.sidebar:
     else:
         st.caption("👉 Click anywhere on the map (main area) to drop a pin.")
 
-        if mode_changed or "map_lat_input" not in st.session_state:
+        if mode_changed or force_resync or "map_lat_input" not in st.session_state:
             st.session_state["map_lat_input"] = float(st.session_state["picked_lat"])
             st.session_state["map_lon_input"] = float(st.session_state["picked_lon"])
 
@@ -482,10 +487,14 @@ if loc_mode == "Pick on map":
             ):
                 st.session_state["picked_lat"] = clicked_lat
                 st.session_state["picked_lon"] = clicked_lon
-                # Keep the sidebar's map-mode number inputs in sync too,
-                # since they own their own widget state once created.
-                st.session_state["map_lat_input"] = clicked_lat
-                st.session_state["map_lon_input"] = clicked_lon
+                # Can't write the sidebar's widget keys (map_lat_input /
+                # map_lon_input) directly here — that widget already ran
+                # earlier in this script pass, and Streamlit disallows
+                # mutating a widget's key after it has been instantiated
+                # in the same run. Instead, flag a resync; the sidebar
+                # block consumes this flag *before* creating the widgets
+                # on the next rerun, so it picks up picked_lat/picked_lon.
+                st.session_state["force_resync_location"] = True
                 st.rerun()
 
         st.caption(
