@@ -512,7 +512,15 @@ EXECUTE → RETRIEVE → ANALYZE → RECOMMEND → RETURN JSON
 """
 import json
 
-def agent_node(state: MarineState):
+def agent_node(state: MarineState, callbacks=None):
+    """
+    callbacks: optional list of LangChain BaseCallbackHandler instances.
+    Passed straight through to agent.invoke() so a caller (e.g. the
+    Streamlit UI) can observe tool_start/tool_end events in real time
+    without changing normal graph.invoke()/graph.stream() behavior,
+    since LangGraph calls this node with just `state` and callbacks
+    stays None in that case.
+    """
 
     plan = state.get("plan", "")
 
@@ -523,15 +531,18 @@ def agent_node(state: MarineState):
     latitude = state["latitude"]
     longitude = state["longitude"]
 
-    response = agent.invoke({
-        "messages": [
-            {
-                "role": "system",
-                "content": AGENT_SYSTEM_PROMPT
-            },
-            {
-                "role": "user",
-                "content": f"""
+    invoke_config = {"callbacks": callbacks} if callbacks else None
+
+    response = agent.invoke(
+        {
+            "messages": [
+                {
+                    "role": "system",
+                    "content": AGENT_SYSTEM_PROMPT
+                },
+                {
+                    "role": "user",
+                    "content": f"""
 User Question:
 {user_question}
 
@@ -549,9 +560,11 @@ generate a recommendation based ONLY on the retrieved data.
 Return ONLY the JSON object.
 Do NOT use Markdown code fences such as ```json.
 """
-            }
-        ]
-    })
+                }
+            ]
+        },
+        config=invoke_config,
+    )
 
     # Get final response from the agent
     content = response["messages"][-1].content
