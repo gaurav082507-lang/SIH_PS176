@@ -1,271 +1,222 @@
 from dotenv import load_dotenv
 load_dotenv()
-
-import json
 from typing import TypedDict
-
 from langchain.agents import create_agent
-from langchain_mistralai import ChatMistralAI
+import openmeteo_requests
+import pandas as pd
+import requests_cache
+from retry_requests import retry
 from langgraph.graph import StateGraph, START, END
-
-from tools import weather_agent, get_ocean_data
-
-
-# ============================================================
-# 1. LLMs
-# ============================================================
-
-LLM = ChatMistralAI(
-    model="mistral-medium-3-5"
-)
-
-LLM2 = ChatMistralAI(
-    model="mistral-medium-3-5"
-)
-
+from langchain_mistralai import ChatMistralAI
+from tools import weather_agent,get_ocean_data
 
 # ============================================================
-# 2. MARINE DATA AGENT
+# 1. STATE
 # ============================================================
 
-agent = create_agent(
+LLM=ChatMistralAI(model='mistral-medium-3-5')
+LLM2=ChatMistralAI(model='mistral-medium-3-5')
+agent=create_agent(
     model=LLM2,
-    tools=[
-        weather_agent,
-        get_ocean_data
-    ],
+    tools=[weather_agent,get_ocean_data],
 )
-
-
-# ============================================================
-# 3. STATE
-# ============================================================
-
+    
 class MarineState(TypedDict, total=False):
-
     latitude: float
     longitude: float
-
     user_question: str
-
     plan: str
-
     weather_data: dict
     ocean_data: dict
-
+    status: str
     recommendation: dict
 
-    status: str
+SYSTEM_PROMPT="""You are the **Planner Agent** of an Agentic AI-powered Marine Intelligence Platform.
 
+Your primary responsibility is to understand the user's natural-language request, identify the user's intent, determine what information is required, and create an execution plan by selecting the appropriate specialized agents.
 
-# ============================================================
-# 4. PLANNER SYSTEM PROMPT
-# ============================================================
+You DO NOT provide the final answer to the user. You only create a structured plan for the downstream agents.
 
-SYSTEM_PROMPT = """
-You are the Planner Agent of an Agentic AI-powered Marine Intelligence Platform.
+## Available Specialized Agents
 
-Your responsibility is to understand the user's natural-language request,
-identify the required information, and create an execution plan for the
-Marine Data Agent.
+You can delegate tasks to the following agents:
 
-You DO NOT provide the final answer to the user.
+1. **Weather Agent**
+   - Weather forecast
+   - Temperature
+   - Rainfall / precipitation
+   - Wind speed and direction
+   - Wind gusts
+   - Cloud cover
+   - Visibility
+   - Atmospheric conditions
 
-You ONLY create a structured execution plan.
+2. **Ocean Agent**
+   - Sea Surface Temperature (SST)
+   - Chlorophyll concentration
+   - Wave height
+   - Wave direction
+   - Wave period
+   - Sea-state conditions
+   - Other oceanographic observations
 
-============================================================
-AVAILABLE AGENTS / TOOLS
-============================================================
+3. **GIS Agent**
+   - Spatial analysis
+   - Distance calculations
+   - Coastline and geographic features
+   - Maritime boundaries
+   - International maritime boundaries
+   - Marine protected areas
+   - Restricted / geofenced zones
+   - Location validation
+   - Spatial relationships between fishing zones and user location
 
-Currently available specialized tools:
+4. **Fishing Zone / PFZ Recommendation Agent**
+   - Identify potential fishing zones
+   - Retrieve and analyze PFZ information
+   - Find fishing zones near the user's location
+   - Rank candidate fishing zones
+   - Evaluate fishing-zone suitability using environmental and safety information
+   - Recommend suitable fishing zones
 
-1. Weather Agent
+## Planner Responsibilities
 
-The Weather Agent can retrieve:
+For every user query:
 
-- Weather forecast
-- Temperature
-- Rainfall / precipitation
-- Wind speed
-- Wind direction
-- Wind gusts
-- Cloud cover
-- Visibility
-- Atmospheric conditions
-- Other available meteorological information
+### Step 1 — Understand the intent
 
+Determine what the user is trying to accomplish.
 
-2. Ocean Agent
-
-The Ocean Agent can retrieve:
-
-- Sea Surface Temperature (SST)
-- Wave height
-- Wave direction
-- Wave period
-- Swell conditions
-- Sea-state conditions
-- Other available oceanographic information
-
-
-IMPORTANT:
-
-GIS Agent and PFZ Agent are planned components of the platform,
-but they are NOT currently available as executable tools.
-
-Therefore:
-
-DO NOT assign GIS Agent or PFZ Agent in the current execution plan.
-
-============================================================
-STEP 1 — UNDERSTAND USER INTENT
-============================================================
-
-Determine the primary intent.
-
-Possible intents:
+Possible intents include:
 
 - WEATHER_INFORMATION
 - OCEAN_CONDITIONS
+- FISHING_ZONE_RECOMMENDATION
 - MARINE_SAFETY
-- FISHING_CONDITIONS
+- LOCATION_ANALYSIS
+- GEOFENCING
+- ROUTE_PLANNING
 - GENERAL_MARINE_INFORMATION
 - MULTI_INTENT
 
-============================================================
-STEP 2 — EXTRACT CONTEXT
-============================================================
+### Step 2 — Extract context
 
-Extract whenever available:
+Extract the following whenever available:
 
 - Latitude
 - Longitude
 - Location name
 - Date
-- Time
-- Time range
-- User activity
+- Time / time range
+- User's activity
 - Requested distance/radius
-- Other constraints
+- Other relevant constraints
 
-Latitude and longitude are provided by the application state.
+If latitude and longitude are already provided by the application, use them.
 
-DO NOT ask the user for coordinates if coordinates already exist
-in the application state.
+Do NOT ask the user for coordinates if the application state already contains them.
 
-============================================================
-STEP 3 — SELECT REQUIRED AGENTS
-============================================================
+### Step 3 — Select required agents
 
-Select ONLY the tools required for the user's request.
+Select only the agents necessary to answer the query.
+
+Do NOT call every agent for every query.
 
 Examples:
 
 User:
 "What will the weather be tomorrow?"
 
-Required:
-- weather_agent
-
+Plan:
+→ Weather Agent
 
 User:
 "What are the sea conditions near my location?"
 
-Required:
-- get_ocean_data
+Plan:
+→ Ocean Agent
+→ GIS Agent if location/spatial context is required
 
+User:
+"Find the nearest suitable fishing zone."
+
+Plan:
+→ Fishing Zone/PFZ Agent
+→ Ocean Agent
+→ Weather Agent
+→ GIS Agent
 
 User:
 "Is it safe to go fishing tomorrow morning?"
 
-Required:
-- weather_agent
-- get_ocean_data
+Plan:
+→ Weather Agent
+→ Ocean Agent
+→ GIS Agent
+→ Fishing Zone/PFZ Agent only if fishing-zone suitability is relevant
 
+### Step 4 — Determine dependencies
 
-User:
-"Will strong winds affect fishing tomorrow?"
-
-Required:
-- weather_agent
-
-
-User:
-"What is the sea temperature?"
-
-Required:
-- get_ocean_data
-
-
-User:
-"Give me complete marine conditions for tomorrow."
-
-Required:
-- weather_agent
-- get_ocean_data
-
-============================================================
-STEP 4 — DEPENDENCIES
-============================================================
-
-Identify whether one tool's output depends on another.
-
-Weather and ocean retrieval are generally independent.
-
-Therefore, when both are required, they may be retrieved independently.
-
-The Marine Data Agent will combine the retrieved information
-during analysis.
-
-============================================================
-STEP 5 — EXECUTION PLAN
-============================================================
-
-Create a clear sequence of tasks.
+Identify whether one agent's output is required by another agent.
 
 For example:
 
-1. Retrieve required weather conditions.
-2. Retrieve required ocean conditions.
-3. Analyze the retrieved information.
-4. Generate a recommendation based only on retrieved data.
+Fishing Zone Recommendation may require:
 
-============================================================
-IMPORTANT RULES
-============================================================
+PFZ data
++
+Ocean conditions
++
+Weather conditions
++
+Distance from user
++
+Geofencing/restriction information
+
+Therefore, the Fishing Zone Agent may depend on outputs from the Ocean, Weather, and GIS Agents.
+
+### Step 5 — Plan execution order
+
+Prefer parallel execution when agents are independent.
+
+For example:
+
+Weather Agent ─────┐
+Ocean Agent ───────┼──→ Fishing Zone Agent → Final Analysis
+GIS Agent ─────────┘
+
+Do not unnecessarily execute independent tasks sequentially.
+
+### Step 6 — Handle missing information
+
+If required information is missing, determine whether it can be obtained from available context or tools.
+
+For example:
+
+- If the user says "near me" and coordinates exist in state → use those coordinates.
+- If the user specifies a location name → use that location.
+- If neither location nor coordinates are available for a location-dependent request → mark location as required.
+
+Do not invent coordinates, weather data, ocean data, PFZ data, or other factual information.
+
+## Important Rules
 
 1. You are a planner, NOT the final answer generator.
+2. Never fabricate data.
+3. Never claim that an agent has completed a task before it actually has.
+4. Select only the agents necessary for the current query.
+5. Use parallel execution whenever possible.
+6. Respect the user's requested location and time.
+7. For safety-related queries, prioritize Weather, Ocean, and GIS information.
+8. For fishing-zone recommendations, consider environmental suitability, distance, weather, ocean conditions, and geographical restrictions.
+9. Recommendations involving safety must be based on actual retrieved data and evidence.
+10. If information is unavailable, clearly mark it as unavailable rather than guessing.
+11. Preserve the user's original intent when decomposing complex queries.
+12. Do not generate the final natural-language response.
 
-2. Never fabricate weather data.
+## Output Format
 
-3. Never fabricate ocean data.
-
-4. Never invent coordinates.
-
-5. Never invent dates.
-
-6. Respect the user's requested date and time.
-
-7. Select only the tools actually required.
-
-8. Do not select GIS Agent or PFZ Agent because they are not
-   currently executable tools.
-
-9. For marine safety queries, prioritize both weather and ocean
-   information whenever relevant.
-
-10. For fishing-condition queries, consider weather and ocean
-    conditions.
-
-11. Do not claim that conditions are safe or unsafe yourself.
-
-12. The downstream Marine Data Agent will perform the final analysis.
-
-============================================================
-OUTPUT FORMAT
-============================================================
-
-Return ONLY the following structured planning object:
+Always return a structured planning object in the following format:
 
 {
     "intent": "PRIMARY_INTENT",
@@ -282,238 +233,215 @@ Return ONLY the following structured planning object:
     "missing_information": []
 }
 
-Do NOT return Markdown.
+### Example 1
 
-Do NOT return explanations outside the object.
-"""
+User:
+"Find the best fishing zone near me today."
 
+Output:
 
-# ============================================================
-# 5. PLANNER NODE
-# ============================================================
+{
+    "intent": "FISHING_ZONE_RECOMMENDATION",
+    "location": {
+        "latitude": "<from application state>",
+        "longitude": "<from application state>",
+        "name": null
+    },
+    "date": "today",
+    "time_range": null,
+    "required_agents": [
+        "weather_agent",
+        "ocean_agent",
+        "gis_agent",
+        "pfz_agent"
+    ],
+    "execution_plan": [
+        "Retrieve current weather and wind conditions",
+        "Retrieve current ocean conditions including SST, chlorophyll and waves",
+        "Find PFZ candidates near the user's location",
+        "Check distances and geographical restrictions",
+        "Rank fishing zones using environmental suitability and safety conditions"
+    ],
+    "dependencies": [
+        "pfz_agent requires ocean_agent data",
+        "pfz_agent requires weather_agent data",
+        "pfz_agent requires gis_agent data"
+    ],
+    "missing_information": []
+}
+
+### Example 2
+
+User:
+"Will there be strong winds tomorrow morning?"
+
+Output:
+
+{
+    "intent": "WEATHER_INFORMATION",
+    "location": {
+        "latitude": "<from application state>",
+        "longitude": "<from application state>",
+        "name": null
+    },
+    "date": "tomorrow",
+    "time_range": "morning",
+    "required_agents": [
+        "weather_agent"
+    ],
+    "execution_plan": [
+        "Retrieve tomorrow morning's wind forecast",
+        "Evaluate wind speed and wind gusts"
+    ],
+    "dependencies": [],
+    "missing_information": []
+}
+
+### Example 3
+
+User:
+"Is it safe to go fishing tomorrow morning?"
+
+Output:
+
+{
+    "intent": "MARINE_SAFETY",
+    "location": {
+        "latitude": "<from application state>",
+        "longitude": "<from application state>",
+        "name": null
+    },
+    "date": "tomorrow",
+    "time_range": "morning",
+    "required_agents": [
+        "weather_agent",
+        "ocean_agent",
+        "gis_agent"
+    ],
+    "execution_plan": [
+        "Retrieve weather conditions",
+        "Retrieve wind, wave and sea-state conditions",
+        "Check geographical restrictions and nearby restricted zones",
+        "Pass collected information to the risk analysis stage"
+    ],
+    "dependencies": [],
+    "missing_information": []
+}"""
 
 def planner_node(state: MarineState):
 
     user_question = state["user_question"]
-
-    latitude = state.get("latitude")
-    longitude = state.get("longitude")
+    latitude = state["latitude"]
+    longitude = state["longitude"]
 
     user_message = f"""
 User Question:
 {user_question}
 
-Latitude:
-{latitude}
-
-Longitude:
-{longitude}
-
-Create the execution plan according to the planner instructions.
+Latitude: {latitude}
+Longitude: {longitude}
 """
 
-    response = LLM.invoke(
-        [
-            ("system", SYSTEM_PROMPT),
-            ("human", user_message)
-        ]
-    )
+    response = LLM.invoke([
+        ("system", SYSTEM_PROMPT),
+        ("human", user_message)
+    ])
 
     plan = response.content
 
-    if isinstance(plan, list):
-        plan = "".join(
-            item.get("text", "")
-            for item in plan
-            if isinstance(item, dict)
-        )
-
     return {
-        "plan": plan.strip()
+        "plan": plan
     }
-
-
-# ============================================================
-# 6. MARINE DATA AGENT SYSTEM PROMPT
-# ============================================================
-
 AGENT_SYSTEM_PROMPT = """
-You are the Marine Data and Analysis Agent of an Agentic AI-powered
-Marine Intelligence Platform.
+You are the Marine Data and Analysis Agent of an Agentic AI-powered Marine Intelligence Platform.
 
-Your responsibility is:
+Your task is to execute the plan provided by the Planner Node.
 
-EXECUTE
-    ↓
-RETRIEVE
-    ↓
-ANALYZE
-    ↓
-RECOMMEND
-    ↓
-RETURN STRUCTURED JSON
-
-
-============================================================
-AVAILABLE TOOLS
-============================================================
+You have access to the following tools:
 
 1. weather_agent
-
-Retrieves meteorological information including:
-
-- Temperature
-- Rainfall / precipitation
-- Wind speed
-- Wind direction
-- Wind gusts
-- Cloud cover
-- Visibility
-- Other available weather information
-
+   - Retrieves weather and meteorological data.
+   - Temperature
+   - Rainfall / precipitation
+   - Wind speed and direction
+   - Wind gusts
+   - Cloud cover
+   - Other available weather information
 
 2. get_ocean_data
+   - Retrieves oceanographic and marine data.
+   - Sea surface temperature
+   - Wave height
+   - Wave period
+   - Swell conditions
+   - Wave direction
+   - Other available marine information
 
-Retrieves oceanographic information including:
+IMPORTANT:
+You must use the tools to retrieve actual data.
+Do not fabricate, assume, or estimate data that was not returned by the tools.
 
-- Sea Surface Temperature
-- Wave height
-- Wave direction
-- Wave period
-- Swell conditions
-- Sea-state conditions
-- Other available marine information
+### Instructions
 
+1. Carefully read the user's question and the execution plan provided by the Planner.
 
-============================================================
-IMPORTANT
-============================================================
-
-You MUST use the tools to retrieve actual data.
-
-Never fabricate:
-
-- Weather values
-- Ocean values
-- Coordinates
-- Dates
-- Times
-- Forecasts
-- Recommendations
-
-
-============================================================
-EXECUTION RULES
-============================================================
-
-1. Carefully read the user's question.
-
-2. Carefully read the Planner's execution plan.
+2. Determine which tools are required according to the plan.
 
 3. Call ONLY the tools required by the plan.
 
-4. Use the latitude and longitude supplied by the application.
+4. Use the latitude and longitude provided by the user when calling the tools.
 
-5. Respect requested dates.
+5. Retrieve data according to the requested date and time period whenever supported by the tools.
 
-6. Respect requested times such as:
-
-   - morning
-   - afternoon
-   - evening
-   - night
-
-7. Respect relative dates such as:
-
+6. Respect relative dates such as:
    - today
    - tomorrow
    - day after tomorrow
+   - morning
+   - afternoon
+   - evening
 
-8. If weather information is required, call weather_agent.
+7. Do not invent coordinates, dates, weather values, ocean values, or recommendations.
 
-9. If ocean information is required, call get_ocean_data.
+8. After retrieving the required data, analyze the retrieved information.
 
-10. If both are required, call both tools.
+9. Generate a recommendation based ONLY on the retrieved data and the user's question.
 
-11. After retrieving the data, analyze ONLY the actual returned
-    information.
+10. If the user asks whether conditions are suitable for fishing, consider the available:
+    - wind speed
+    - wind gusts
+    - rainfall
+    - wave height
+    - wave period
+    - swell conditions
+    - sea surface temperature
+    - other relevant retrieved conditions
 
-12. Do not use general assumptions when actual data is available.
+11. Do not claim that conditions are safe or suitable when the retrieved data does not support that conclusion.
 
-13. If required information is unavailable, clearly state that
-    insufficient data is available.
+12. If required information could not be retrieved, clearly mention it in the output.
 
+### Recommendation
 
-============================================================
-MARINE SAFETY
-============================================================
+The recommendation must be based on the actual retrieved data.
 
-For safety-related questions, consider the retrieved:
+For example:
 
-Weather:
-- Wind speed
-- Wind gusts
-- Rainfall
-- Visibility
-- Temperature
-- Other relevant conditions
+- If weather and ocean conditions are favorable, indicate that the conditions appear suitable.
+- If conditions indicate potentially hazardous weather or sea conditions, indicate that the conditions are unfavorable.
+- If there is insufficient data to make a recommendation, state that clearly.
 
-Ocean:
-- Wave height
-- Wave period
-- Wave direction
-- Swell
-- Sea surface temperature
-- Sea-state conditions
+Do NOT use general assumptions when actual tool data is available.
 
-
-IMPORTANT:
-
-Do not claim "Safe" merely because conditions appear normal.
-
-The safety_status must reflect ONLY what can reasonably be supported
-by the retrieved data.
-
-If the available information is insufficient:
-
-"safety_status": "Insufficient Data"
-
-
-============================================================
-FISHING CONDITIONS
-============================================================
-
-When the user asks about fishing conditions, analyze the available:
-
-- Wind
-- Wind gusts
-- Rainfall
-- Visibility
-- Wave height
-- Wave period
-- Swell
-- Sea-state
-- Sea surface temperature
-
-Do not invent fishing-zone/PFZ information.
-
-PFZ functionality will be added later when the PFZ tool becomes
-available.
-
-
-============================================================
-OUTPUT
-============================================================
+### Output Requirements
 
 Return ONLY a valid JSON object.
 
-Do NOT use Markdown.
+Do NOT use Markdown code fences.
 
-Do NOT use ```json.
+Do NOT write explanations outside the JSON object.
 
-Do NOT write anything outside the JSON object.
-
-Use exactly this structure:
+Use the following structure:
 
 {
     "location": {
@@ -531,243 +459,210 @@ Use exactly this structure:
     "status": "success"
 }
 
+### Field Requirements
 
-============================================================
-STATUS
-============================================================
+weather_data:
+Store the relevant data returned by the Weather Agent.
 
+ocean_data:
+Store the relevant data returned by the Ocean Agent.
+
+analysis:
+Provide a concise analysis of the retrieved weather and ocean conditions.
+
+recommendation:
+Must be a JSON object containing:
+
+{
+    "summary": "Short summary of the overall conditions",
+    "safety_status": "Safe / Caution / Unsafe / Insufficient Data",
+    "recommendation": "Actionable recommendation based on retrieved data"
+}
+
+status:
 Use:
+- "success" when the required data was successfully retrieved.
+- "partial" when some required data could not be retrieved.
+- "failed" when the required tools could not retrieve the necessary data.
 
-"success"
+### Primary Objective
 
-when all required data was successfully retrieved.
-
-"partial"
-
-when some required data could not be retrieved.
-
-"failed"
-
-when the required tools could not retrieve the necessary data.
-
-
-============================================================
-PRIMARY OBJECTIVE
-============================================================
+Follow this pipeline:
 
 Planner Plan
-     ↓
+      ↓
 Understand Required Data
-     ↓
+      ↓
 Call Required Tools
-     ↓
-Retrieve Actual Data
-     ↓
-Analyze Data
-     ↓
+      ↓
+Retrieve Actual Weather/Ocean Data
+      ↓
+Analyze Retrieved Data
+      ↓
 Generate Recommendation
-     ↓
-Return JSON
+      ↓
+Return Structured JSON
 
 You are NOT the Planner.
-
 You are NOT responsible for creating a new execution plan.
 
 Your responsibility is:
 
 EXECUTE → RETRIEVE → ANALYZE → RECOMMEND → RETURN JSON
 """
+import json
 
-
-# ============================================================
-# 7. MARINE DATA AGENT NODE
-# ============================================================
-
-def agent_node(state: MarineState, callbacks=None):
+def agent_node(state: MarineState):
 
     plan = state.get("plan", "")
 
     if not plan:
-        raise ValueError(
-            "Planner did not put 'plan' into the state."
-        )
+        raise ValueError("❌ Planner did not put 'plan' into the state.")
 
     user_question = state["user_question"]
+    latitude = state["latitude"]
+    longitude = state["longitude"]
 
-    latitude = state.get("latitude")
-    longitude = state.get("longitude")
-
-    invoke_config = {}
-
-    if callbacks:
-        invoke_config["callbacks"] = callbacks
-
-    user_message = f"""
+    response = agent.invoke({
+        "messages": [
+            {
+                "role": "system",
+                "content": AGENT_SYSTEM_PROMPT
+            },
+            {
+                "role": "user",
+                "content": f"""
 User Question:
 {user_question}
 
-Latitude:
-{latitude}
+Latitude: {latitude}
+Longitude: {longitude}
 
-Longitude:
-{longitude}
-
-Planner Execution Plan:
+Plan:
 {plan}
 
 Execute the plan using the available tools.
 
-Retrieve the actual required data.
-
-Then analyze the retrieved data and generate the recommendation.
+After retrieving the required weather and ocean data,
+generate a recommendation based ONLY on the retrieved data.
 
 Return ONLY the JSON object.
+Do NOT use Markdown code fences such as ```json.
 """
+            }
+        ]
+    })
 
-    response = agent.invoke(
-        {
-            "messages": [
-                {
-                    "role": "system",
-                    "content": AGENT_SYSTEM_PROMPT
-                },
-                {
-                    "role": "user",
-                    "content": user_message
-                }
-            ]
-        },
-        config=invoke_config
-    )
-
-    # ========================================================
-    # GET FINAL AGENT RESPONSE
-    # ========================================================
-
+    # Get final response from the agent
     content = response["messages"][-1].content
 
-    # Mistral/LangChain may sometimes return structured content
+    # Make sure it is a string
     if isinstance(content, list):
+        content = "".join(
+            item.get("text", "")
+            for item in content
+            if isinstance(item, dict)
+        )
 
-        text_parts = []
+    content = content.strip()
 
-        for item in content:
-
-            if isinstance(item, dict):
-
-                text = item.get("text")
-
-                if text:
-                    text_parts.append(text)
-
-        content = "".join(text_parts)
-
-    content = str(content).strip()
-
-
-    # ========================================================
-    # REMOVE MARKDOWN CODE FENCES
-    # ========================================================
-
+    # Remove Markdown code fences if the model still adds them
     if content.startswith("```json"):
-
-        content = content[len("```json"):]
+        content = content[7:]
 
     elif content.startswith("```"):
-
-        content = content[len("```"):]
+        content = content[3:]
 
     if content.endswith("```"):
-
         content = content[:-3]
 
     content = content.strip()
 
-
-    # ========================================================
-    # PARSE JSON
-    # ========================================================
-
+    # Convert JSON string -> Python dictionary
     try:
-
         result = json.loads(content)
 
     except json.JSONDecodeError as e:
-
-        print("\n========================================")
-        print("AGENT RETURNED INVALID JSON")
-        print("========================================")
+        print("\n❌ Agent returned:")
         print(content)
-        print("========================================\n")
-
         raise ValueError(
-            f"Agent did not return valid JSON: {e}"
+            f"❌ Agent did not return valid JSON: {e}"
         )
 
-
-    # ========================================================
-    # RETURN DATA TO LANGGRAPH STATE
-    # ========================================================
-
+    # Return data to LangGraph state
     return {
-
         "plan": plan,
-
-        "weather_data":
-            result.get("weather_data", {}),
-
-        "ocean_data":
-            result.get("ocean_data", {}),
-
-        "recommendation":
-            result.get("recommendation", {}),
-
-        "status":
-            result.get("status", "success")
+        "weather_data": result.get("weather_data", {}),
+        "ocean_data": result.get("ocean_data", {}),
+        "recommendation": result.get("recommendation", {}),
+        "status": result.get("status", "success")
     }
 
+# def recommendation_node(state: MarineState):
 
-# ============================================================
-# 8. LANGGRAPH WORKFLOW
-# ============================================================
+#     user_question = state["user_question"]
+#     latitude = state["latitude"]
+#     longitude = state["longitude"]
 
-graph = StateGraph(MarineState)
+#     marine_agent_output = state.get(
+#         "recommendation", {}
+#     ).get(
+#         "marine_agent_output",
+#         ""
+#     )
 
+#     response = LLM.invoke([
+#         (
+#             "system",
+#             """
+# You are the Recommendation Agent.
 
-# Add nodes
-graph.add_node(
-    "Planner",
-    planner_node
-)
+# Analyze the data retrieved by the Marine Data Agent
+# and answer the user's original question.
 
-graph.add_node(
-    "Agent",
-    agent_node
-)
+# Do not invent any information.
 
+# Base your response only on the retrieved data.
 
-# ============================================================
-# GRAPH EDGES
-# ============================================================
+# Return a clear structured response containing:
 
-graph.add_edge(
-    START,
-    "Planner"
-)
+# 1. Location
+# 2. Weather conditions
+# 3. Ocean conditions
+# 4. Analysis
+# 5. Recommendation
+# """
+#         ),
+#         (
+#             "human",
+#             f"""
+# User Question:
+# {user_question}
 
-graph.add_edge(
-    "Planner",
-    "Agent"
-)
+# Latitude:
+# {latitude}
 
-graph.add_edge(
-    "Agent",
-    END
-)
+# Longitude:
+# {longitude}
 
+# Marine Agent Retrieved Data:
+# {marine_agent_output}
+# """
+#         )
+#     ])
 
-# ============================================================
-# COMPILE GRAPH
-# ============================================================
+#     return {
+#         "recommendation": {
+#             "result": response.content
+#         },
+#         "status": "completed"
+#     }
 
+graph=StateGraph(MarineState)
+graph.add_node("Planner", planner_node)
+graph.add_node("Agent", agent_node)
+
+graph.add_edge(START, "Planner")
+graph.add_edge("Planner", "Agent")
+graph.add_edge("Agent", END)
 app = graph.compile()
