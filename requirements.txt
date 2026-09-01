@@ -10,3 +10,5 @@ openmeteo-requests
 requests-cache
 retry-requests
 langchain-mistralai
+requests
+beautifulsoup4
