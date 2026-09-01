@@ -265,6 +265,7 @@ STATUS_LABEL = {
 TOOL_LABELS = {
     "weather_tool": ("☁️", "Weather Tool"),
     "ocean_tool": ("🌊", "Ocean Tool"),
+    "tide_tool": ("🌙", "Tide Tool"),
 }
 
 
@@ -298,6 +299,7 @@ def render_pipeline_html(status: dict) -> str:
         '<div class="tools-row">'
         + _tool_chip_html("weather_tool", status.get("weather_tool", "pending"))
         + _tool_chip_html("ocean_tool", status.get("ocean_tool", "pending"))
+        + _tool_chip_html("tide_tool", status.get("tide_tool", "pending"))
         + "</div>"
     )
 
@@ -316,14 +318,15 @@ def render_pipeline_html(status: dict) -> str:
 
 class ToolTracker(BaseCallbackHandler):
     """
-    LangChain callback handler that flips weather_tool / ocean_tool status
-    to 'running' -> 'done' as the underlying agent actually calls them,
+    LangChain callback handler that flips weather_tool / ocean_tool / tide_tool
+    status to 'running' -> 'done' as the underlying agent actually calls them,
     and re-renders the pipeline placeholder live.
     """
 
     TOOL_KEY_MAP = {
         "weather_agent": "weather_tool",
         "get_ocean_data": "ocean_tool",
+        "get_tide": "tide_tool",
     }
 
     def __init__(self, status: dict, placeholder):
@@ -559,7 +562,7 @@ def render_result(latitude, longitude, result):
         with st.expander("🧭 Planner output"):
             st.text(result["plan"])
 
-    tab1, tab2 = st.tabs(["🌤️ Weather data", "🌊 Ocean data"])
+    tab1, tab2, tab3 = st.tabs(["🌤️ Weather data", "🌊 Ocean data", "🌙 Tide data"])
 
     with tab1:
         wd = result.get("weather_data", {}) or {}
@@ -596,6 +599,46 @@ def render_result(latitude, longitude, result):
             else:
                 st.json(od)
 
+    with tab3:
+        td = result.get("tide_data", {}) or {}
+        if not td:
+            st.info("No tide data returned (not needed for this query, or unavailable).")
+        elif td.get("success") is False:
+            st.warning(f"Tide lookup failed: {td.get('error', 'Unknown error')}")
+        else:
+            # get_tide's response can come through as the raw tool output
+            # ({"success", "data": {"station", "tides": {...}}}) or already
+            # unwrapped by the LLM — handle both shapes defensively.
+            inner = td.get("data", td)
+            station = inner.get("station") or {}
+            tides = inner.get("tides") or inner
+
+            if station:
+                st.markdown(
+                    f"**Nearest station:** {station.get('name', 'N/A')} "
+                    f"({station.get('distance_km', '?')} km away)"
+                )
+
+            high_tide = tides.get("high_tide") or []
+            low_tide = tides.get("low_tide") or []
+
+            col_a, col_b = st.columns(2)
+            with col_a:
+                st.markdown("**⬆️ High tide**")
+                if high_tide:
+                    st.dataframe(pd.DataFrame(high_tide), use_container_width=True, hide_index=True)
+                else:
+                    st.caption("No high tide entries returned.")
+            with col_b:
+                st.markdown("**⬇️ Low tide**")
+                if low_tide:
+                    st.dataframe(pd.DataFrame(low_tide), use_container_width=True, hide_index=True)
+                else:
+                    st.caption("No low tide entries returned.")
+
+            if not high_tide and not low_tide:
+                st.json(td)
+
     if show_raw:
         with st.expander("🔍 Raw JSON result"):
             st.json(result)
@@ -617,6 +660,7 @@ if submitted:
             "agent": "pending",
             "weather_tool": "pending",
             "ocean_tool": "pending",
+            "tide_tool": "pending",
             "recommendation": "pending",
         }
         diagram_placeholder = st.empty()
@@ -628,6 +672,7 @@ if submitted:
             "user_question": question,
             "weather_data": {},
             "ocean_data": {},
+            "tide_data": {},
             "plan": "",
             "status": "in_progress",
             "recommendation": {},
@@ -654,7 +699,7 @@ if submitted:
             state.update(agent_out)
 
             # Any tool never called by the agent -> mark as "not needed"
-            for tool_key in ("weather_tool", "ocean_tool"):
+            for tool_key in ("weather_tool", "ocean_tool", "tide_tool"):
                 if node_status[tool_key] == "pending":
                     node_status[tool_key] = "skipped"
 
