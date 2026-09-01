@@ -1,6 +1,7 @@
 from dotenv import load_dotenv
 load_dotenv()
 from typing import TypedDict
+from datetime import date
 from langchain.agents import create_agent
 import openmeteo_requests
 import pandas as pd
@@ -8,7 +9,8 @@ import requests_cache
 from retry_requests import retry
 from langgraph.graph import StateGraph, START, END
 from langchain_mistralai import ChatMistralAI
-from tools import weather_agent,get_ocean_data
+from tools import weather_agent, get_ocean_data
+from tide_tool import get_tide
 
 # ============================================================
 # 1. STATE
@@ -18,7 +20,7 @@ LLM=ChatMistralAI(model='mistral-medium-3-5')
 LLM2=ChatMistralAI(model='mistral-medium-3-5')
 agent=create_agent(
     model=LLM2,
-    tools=[weather_agent,get_ocean_data],
+    tools=[weather_agent, get_ocean_data, get_tide],
 )
     
 class MarineState(TypedDict, total=False):
@@ -28,6 +30,7 @@ class MarineState(TypedDict, total=False):
     plan: str
     weather_data: dict
     ocean_data: dict
+    tide_data: dict
     status: str
     recommendation: dict
 
@@ -79,6 +82,14 @@ You can delegate tasks to the following agents:
    - Evaluate fishing-zone suitability using environmental and safety information
    - Recommend suitable fishing zones
 
+5. **Tide Agent**
+   - High tide and low tide timings
+   - Tide height predictions
+   - Tidal phase (rising / falling)
+   - Tidal current velocity and direction (where available)
+   - Nearest tide station identification
+   - Useful for harbor entry/exit timing, coastal fishing, and navigation safety
+
 ## Planner Responsibilities
 
 For every user query:
@@ -91,6 +102,7 @@ Possible intents include:
 
 - WEATHER_INFORMATION
 - OCEAN_CONDITIONS
+- TIDE_INFORMATION
 - FISHING_ZONE_RECOMMENDATION
 - MARINE_SAFETY
 - LOCATION_ANALYSIS
@@ -153,7 +165,14 @@ Plan:
 → Weather Agent
 → Ocean Agent
 → GIS Agent
+→ Tide Agent if tidal timing affects safety or harbor access
 → Fishing Zone/PFZ Agent only if fishing-zone suitability is relevant
+
+User:
+"When is the next high tide?"
+
+Plan:
+→ Tide Agent
 
 ### Step 4 — Determine dependencies
 
@@ -333,6 +352,7 @@ def planner_node(state: MarineState):
     user_question = state["user_question"]
     latitude = state["latitude"]
     longitude = state["longitude"]
+    today = date.today().isoformat()
 
     user_message = f"""
 User Question:
@@ -340,6 +360,7 @@ User Question:
 
 Latitude: {latitude}
 Longitude: {longitude}
+Today's Date: {today}
 """
 
     response = LLM.invoke([
@@ -377,6 +398,14 @@ You have access to the following tools:
    - Wave direction
    - Other available marine information
 
+3. get_tide
+   - Retrieves high/low tide predictions from the nearest INCOIS tide station.
+   - High tide times and heights
+   - Low tide times and heights
+   - Nearest tide station and its distance from the location
+   - Requires from_date and to_date in YYYY-MM-DD format (see date
+     handling instructions below).
+
 IMPORTANT:
 You must use the tools to retrieve actual data.
 Do not fabricate, assume, or estimate data that was not returned by the tools.
@@ -401,6 +430,15 @@ Do not fabricate, assume, or estimate data that was not returned by the tools.
    - afternoon
    - evening
 
+   The user's message will include "Today's Date" in YYYY-MM-DD format.
+   Use it to resolve relative dates into concrete YYYY-MM-DD values.
+
+6a. get_tide requires explicit from_date and to_date in YYYY-MM-DD format
+    — it does not understand relative terms like "today" or "tomorrow".
+    Compute these yourself from "Today's Date" before calling get_tide.
+    For a single day's tide info, set from_date and to_date to the same
+    date. For a range (e.g. "this week"), compute the appropriate span.
+
 7. Do not invent coordinates, dates, weather values, ocean values, or recommendations.
 
 8. After retrieving the required data, analyze the retrieved information.
@@ -415,6 +453,8 @@ Do not fabricate, assume, or estimate data that was not returned by the tools.
     - wave period
     - swell conditions
     - sea surface temperature
+    - tide timing and height, when relevant (e.g. harbor entry/exit,
+      shallow-water or coastal fishing safety)
     - other relevant retrieved conditions
 
 11. Do not claim that conditions are safe or suitable when the retrieved data does not support that conclusion.
@@ -450,6 +490,7 @@ Use the following structure:
     },
     "weather_data": {},
     "ocean_data": {},
+    "tide_data": {},
     "analysis": "",
     "recommendation": {
         "summary": "",
@@ -466,6 +507,11 @@ Store the relevant data returned by the Weather Agent.
 
 ocean_data:
 Store the relevant data returned by the Ocean Agent.
+
+tide_data:
+Store the relevant data returned by get_tide (nearest station, high/low
+tide times and heights). Leave as an empty object {} if the tide tool
+was not needed for this query.
 
 analysis:
 Provide a concise analysis of the retrieved weather and ocean conditions.
@@ -530,6 +576,7 @@ def agent_node(state: MarineState, callbacks=None):
     user_question = state["user_question"]
     latitude = state["latitude"]
     longitude = state["longitude"]
+    today = date.today().isoformat()
 
     invoke_config = {"callbacks": callbacks} if callbacks else None
 
@@ -548,6 +595,7 @@ User Question:
 
 Latitude: {latitude}
 Longitude: {longitude}
+Today's Date: {today}
 
 Plan:
 {plan}
@@ -607,6 +655,7 @@ Do NOT use Markdown code fences such as ```json.
         "plan": plan,
         "weather_data": result.get("weather_data", {}),
         "ocean_data": result.get("ocean_data", {}),
+        "tide_data": result.get("tide_data", {}),
         "recommendation": result.get("recommendation", {}),
         "status": result.get("status", "success")
     }
